@@ -1,18 +1,23 @@
-"""
-Export package homepage and LICENSE text from node_modules into Excel.
 
-Enhancements in this version:
-- If homepage is missing, derive a candidate from repository.url.
-- If a package has NO LICENSE, still add a row for that package.
-- Column A (Path) now shows the package directory path when NO LICENSE exists.
+#!/usr/bin/env python3
+"""
+Export package homepage, name, declared license, version, and LICENSE text from node_modules into Excel.
 
 Columns:
-- A: Path to LICENSE file (if present) OR package directory path (if LICENSE missing)
-- B: Homepage (homepage or derived from repository.url)
-- C..N: License contents split into 32,767-character chunks
+- A: Path -> LICENSE file path (if present) OR package directory path (if LICENSE missing)
+- B: Homepage -> from manifest 'homepage' or derived from 'repository.url'
+- C: Name -> from manifest 'name' or derived from node_modules path (supports @scope/pkg)
+- D: License -> declared license from manifest (SPDX string or best-effort)
+- E: Version -> from manifest 'version'
+- F..N: License_Chunk_i -> LICENSE contents split into 32,767-character chunks
+
+Enhancements:
+- If homepage is missing, derive a candidate from repository.url.
+- If a package has NO LICENSE file, still add a row for that package (Path = package dir).
+- Robust handling of manifest formats, long license text, and nested node_modules.
 
 Usage:
-  python export_licenses_to_excel.py --root /path/to/node_modules --out licenses.xlsx
+  python grab-licenses.py --root /path/to/node_modules --out licenses.xlsx
 """
 
 import argparse
@@ -35,7 +40,7 @@ LICENSE_BASENAMES = {
 }
 
 # Recognized manifest file names (case-insensitive)
-MANIFEST_BASENAMES = {"package.json", "package"}  # user mentioned 'package' that is a package.json
+MANIFEST_BASENAMES = {"package.json", "package"}  # some systems or tooling may use 'package' without .json
 
 
 def is_probably_text(data: bytes) -> bool:
@@ -115,7 +120,6 @@ def derive_homepage_from_repository(repo_val) -> str | None:
     if repo_val is None:
         return None
 
-    # Pull URL string from either dict or string
     if isinstance(repo_val, dict):
         url = (repo_val.get("url") or "").strip()
     elif isinstance(repo_val, str):
@@ -167,6 +171,68 @@ def derive_homepage_from_repository(repo_val) -> str | None:
     return None
 
 
+def extract_license_value(data: dict) -> str | None:
+    """
+    Return the declared license for the package (best-effort).
+    Supports:
+      - license: "MIT"
+      - license: { type/name/spdx: "MIT" }
+      - licenses: [ { type/name/spdx: "MIT" }, ... ]  (deprecated)
+    """
+    if not data:
+        return None
+
+    lic = data.get("license") or data.get("licence")
+    if isinstance(lic, str):
+        cleaned = lic.strip()
+        if cleaned:
+            return cleaned
+    elif isinstance(lic, dict):
+        for key in ("type", "name", "spdx", "value"):
+            v = lic.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+    licenses = data.get("licenses")
+    if isinstance(licenses, list) and licenses:
+        vals = []
+        for item in licenses:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    vals.append(s)
+            elif isinstance(item, dict):
+                v = item.get("type") or item.get("name") or item.get("spdx") or item.get("value")
+                if isinstance(v, str) and v.strip():
+                    vals.append(v.strip())
+        if vals:
+            return "; ".join(vals)
+
+    return None
+
+
+def derive_package_name(pkg_dir: str) -> str | None:
+    """
+    Derive package name from its location under .../node_modules/.
+    Handles nested node_modules and scopes, e.g.:
+      /path/node_modules/@scope/pkg/... -> @scope/pkg
+      /path/node_modules/pkg/...        -> pkg
+    """
+    norm = os.path.abspath(pkg_dir)
+    parts = norm.split(os.sep)
+    idx = None
+    for i, p in enumerate(parts):
+        if p == "node_modules":
+            idx = i
+    if idx is None or idx + 1 >= len(parts):
+        return os.path.basename(pkg_dir)
+
+    first = parts[idx + 1]
+    if first.startswith("@") and idx + 2 < len(parts):
+        return f"{first}/{parts[idx + 2]}"
+    return first
+
+
 def get_homepage(data: dict) -> str | None:
     """Return homepage, falling back to repository-derived URL."""
     if not data:
@@ -174,28 +240,29 @@ def get_homepage(data: dict) -> str | None:
     homepage = data.get("homepage")
     if isinstance(homepage, str) and homepage.strip():
         return homepage.strip()
-
-    # Fallback to repository.url or repository string
     repo_val = data.get("repository")
     derived = derive_homepage_from_repository(repo_val)
     if derived:
         return derived
-
-    # Optional further fallback (e.g., bugs.url) intentionally omitted per requirements
     return None
 
 
 def build_rows(manifests, node_modules_root):
     """
     For each manifest (i.e., each package), produce rows:
-    [Path, Homepage, chunk1, chunk2, ...]
+    [Path, Homepage, Name, License, Version, chunk1, chunk2, ...]
     Where Path = LICENSE file path if found, otherwise the PACKAGE DIRECTORY path.
     """
     rows = []
     for manifest_path in manifests:
         pkg_dir = os.path.dirname(manifest_path)
         data = parse_manifest(manifest_path)
+
         homepage = get_homepage(data) or ""
+        declared_license = extract_license_value(data) or ""
+        manifest_name = (data.get("name") or "").strip() if data else ""
+        name = manifest_name or (derive_package_name(pkg_dir) or "")
+        version = (data.get("version") or "").strip() if data else ""
 
         # Find LICENSE (if any)
         license_path = find_first_license(pkg_dir)
@@ -203,44 +270,44 @@ def build_rows(manifests, node_modules_root):
             try:
                 text = read_text_file(license_path)
                 chunks = chunk_text(text, EXCEL_CELL_LIMIT)
-                rows.append([license_path, homepage, *chunks])
+                rows.append([license_path, homepage, name, declared_license, version, *chunks])
             except Exception as e:
-                # Unreadable license; still add row with path and error note
-                rows.append([license_path, homepage, f"[Skipped: {e}]"])
+                rows.append([license_path, homepage, name, declared_license, version, f"[Skipped: {e}]"])
         else:
             # No LICENSE: Path should be the package directory path
-            rows.append([pkg_dir, homepage])  # license columns remain empty
+            rows.append([pkg_dir, homepage, name, declared_license, version])  # license columns remain empty
     return rows
 
 
 def to_dataframe(rows):
     """Create a DataFrame with dynamic number of columns."""
     if not rows:
-        return pd.DataFrame(columns=["Path", "Homepage", "License_Chunk_1"])
+        return pd.DataFrame(columns=["Path", "Homepage", "Name", "License", "Version", "License_Chunk_1"])
 
-    # Max number of license chunks across rows
     max_chunks = 0
     for r in rows:
-        chunks_count = max(0, len(r) - 2)  # minus Path + Homepage
+        chunks_count = max(0, len(r) - 5)  # minus Path + Homepage + Name + License + Version
         if chunks_count > max_chunks:
             max_chunks = chunks_count
 
-    columns = ["Path", "Homepage"] + [f"License_Chunk_{i+1}" for i in range(max_chunks)]
+    columns = ["Path", "Homepage", "Name", "License", "Version"] + [f"License_Chunk_{i+1}" for i in range(max_chunks)]
 
-    # Pad rows so they all have the same number of chunk columns
     normalized = []
     for r in rows:
         path = r[0] if len(r) > 0 else ""
         homepage = r[1] if len(r) > 1 else ""
-        chunks = r[2:] if len(r) > 2 else []
+        name = r[2] if len(r) > 2 else ""
+        declared_license = r[3] if len(r) > 3 else ""
+        version = r[4] if len(r) > 4 else ""
+        chunks = r[5:] if len(r) > 5 else []
         padded = chunks + [""] * (max_chunks - len(chunks))
-        normalized.append([path, homepage] + padded)
+        normalized.append([path, homepage, name, declared_license, version] + padded)
 
     return pd.DataFrame(normalized, columns=columns)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export homepage and LICENSE contents from node_modules to Excel.")
+    parser = argparse.ArgumentParser(description="Export homepage, name, license, version, and LICENSE contents from node_modules to Excel.")
     parser.add_argument("--root", default="node_modules", help="Path to node_modules root (default: ./node_modules)")
     parser.add_argument("--out", default="licenses.xlsx", help="Output Excel filename (default: licenses.xlsx)")
     args = parser.parse_args()
@@ -263,7 +330,10 @@ def main():
         ws = writer.sheets["Licenses"]
         ws.column_dimensions["A"].width = 120  # Path (license file OR package dir)
         ws.column_dimensions["B"].width = 60   # Homepage
-        for col_idx in range(3, ws.max_column + 1):
+        ws.column_dimensions["C"].width = 40   # Name
+        ws.column_dimensions["D"].width = 24   # License (declared)
+        ws.column_dimensions["E"].width = 16   # Version
+        for col_idx in range(6, ws.max_column + 1):
             ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 60
 
     print(f"Done. Wrote {len(rows)} row(s) to {args.out}")
